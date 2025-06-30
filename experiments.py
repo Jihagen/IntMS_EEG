@@ -200,6 +200,9 @@ def extract_features(data_dict, bin_size=1000, mode='all_channels', channels=Non
     elif mode == 'iterative_addition':
         sel = channels or list(range(rms_per_ch.shape[1]))
         X = [rms_per_ch[:, sel[:k]] for k in range(1, len(sel)+1)]
+    elif mode == 'rms_matrix':
+        # NEW: return full matrix of each channel’s RMS
+        X = rms_per_ch  # shape (n_bins, n_channels)
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -286,9 +289,76 @@ def save_and_plot(results):
         plt.savefig(f"iter_curve_mae_{name}.png")
         plt.show()
 
-if __name__ == '__main__':
+
+
+# -- Iterative Best Approximation  --------------------------------------------------------
+import os
+import numpy as np
+import itertools
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import cross_val_score
+
+# 2) Aggregate all per-channel RMS and targets
+def aggregate_rms(data_dir, subjects, bin_size=1000):
+    R_list, y_list = [], []
+    for subj in subjects:
+        subj_path = os.path.join(data_dir, subj)
+        for fname in sorted(os.listdir(subj_path)):
+            if not fname.endswith('.mat'):
+                continue
+            data = load_mat_file(os.path.join(subj_path, fname))
+            R, y = extract_features(data, bin_size, mode='rms_matrix')
+            R_list.append(R)
+            y_list.append(y)
+    R_all = np.vstack(R_list)    # shape (total_bins, n_channels)
+    y_all = np.concatenate(y_list)
+    return R_all, y_all
+
+# 3A) Exhaustive search up to size K
+def exhaustive_search(R, y, max_k=3, cv=5):
+    best = {}
+    for k in range(1, max_k+1):
+        best_score, best_combo = np.inf, None
+        for combo in itertools.combinations(range(R.shape[1]), k):
+            Xk = R[:, combo]
+            mae = -np.mean(cross_val_score(Ridge(), Xk, y, cv=cv,
+                                           scoring='neg_mean_absolute_error'))
+            if mae < best_score:
+                best_score, best_combo = mae, combo
+        best[k] = {'channels': best_combo, 'mae': best_score}
+        print(f"Best {k}-combo: {best_combo}, MAE={best_score:.4f}")
+    return best
+
+# 3B) Greedy forward selection
+def greedy_selection(R, y, cv=5):
+    remaining = set(range(R.shape[1]))
+    current, history = [], []
+    while remaining:
+        best_score, best_ch = np.inf, None
+        for ch in remaining:
+            trial = current + [ch]
+            mae = -np.mean(cross_val_score(Ridge(), R[:, trial], y, cv=cv,
+                                           scoring='neg_mean_absolute_error'))
+            if mae < best_score:
+                best_score, best_ch = mae, ch
+        current.append(best_ch)
+        remaining.remove(best_ch)
+        history.append((tuple(current), best_score))
+        print(f"Added ch {best_ch}: combo={current}, MAE={best_score:.4f}")
+    return history
+
+
+
+# -- Main Experiment Runner ------------------------------------------------
+
+
+
+if __name__ == "__main__":
+
+
+
     data_dir = 'data'
-    subjects = ['P1']
+    subjects = ['P3']
     channel_modes = [
         {'name': 'all_channels', 'mode': 'all_channels'},
         {'name': 'single_channel', 'mode': 'single_channel', 'channels': [0]},
@@ -296,3 +366,76 @@ if __name__ == '__main__':
     ]
     results = run_experiment(data_dir, subjects, bin_size=1000, channel_modes=channel_modes)
     save_and_plot(results)
+
+
+    bin_size = 1000
+
+    # 1) Build the full RMS matrix and targets
+    R_all, y_all = aggregate_rms(data_dir, subjects, bin_size)
+
+    # 2) Exhaustive: best combos up to size K
+    max_k = 3
+    best_combos = exhaustive_search(R_all, y_all, max_k=max_k)
+
+    # 3) Greedy forward‐selection
+    greedy_history = greedy_selection(R_all, y_all)
+
+    # === Save & plot exhaustive results ===
+    df_exh = pd.DataFrame([
+        {'k': k,
+         'channels': best_combos[k]['channels'],
+         'mae': best_combos[k]['mae']}
+        for k in sorted(best_combos)
+    ])
+    df_exh.to_csv('best_combos_exhaustive.csv', index=False)
+    print("Saved best_combos_exhaustive.csv")
+
+    plt.figure()
+    plt.plot(df_exh['k'], df_exh['mae'], marker='o', linestyle='-')
+    for _, row in df_exh.iterrows():
+        plt.annotate(
+            ",".join(map(str, row['channels'])),
+            (row['k'], row['mae']),
+            textcoords="offset points", xytext=(0,10), ha='center'
+        )
+    plt.title('Exhaustive Search: Best MAE vs #Channels')
+    plt.xlabel('# Channels in Combo')
+    plt.ylabel('MAE')
+    plt.grid(True)
+    plt.savefig('exhaustive_best_mae.png')
+    plt.show()
+
+    # === Save & plot greedy history ===
+    # Compute incremental improvements
+    history_steps = []
+    prev_mae = None
+    for step, (combo, mae) in enumerate(greedy_history, start=1):
+        improvement = None if prev_mae is None else (prev_mae - mae)
+        history_steps.append({
+            'step': step,
+            'added_channel': combo[-1],
+            'channels': combo,
+            'mae': mae,
+            'improvement': improvement
+        })
+        prev_mae = mae
+
+    df_greedy = pd.DataFrame(history_steps)
+    df_greedy.to_csv('greedy_selection_history.csv', index=False)
+    print("Saved greedy_selection_history.csv")
+
+    plt.figure()
+    plt.plot(df_greedy['step'], df_greedy['mae'], marker='o', linestyle='-')
+    for _, row in df_greedy.iterrows():
+        label = f"+{row['added_channel']}" if row['step']>1 else f"{row['channels']}"
+        plt.annotate(
+            label,
+            (row['step'], row['mae']),
+            textcoords="offset points", xytext=(0,10), ha='center'
+        )
+    plt.title('Greedy Forward Selection: MAE vs Step')
+    plt.xlabel('Selection Step (# Channels)')
+    plt.ylabel('MAE')
+    plt.grid(True)
+    plt.savefig('greedy_mae_history.png')
+    plt.show()
