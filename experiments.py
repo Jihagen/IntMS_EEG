@@ -401,7 +401,7 @@ def run_experiment_from_data(all_data, subjects, bin_size, channel_modes):
 # -------------------- main() --------------------
 
 def main():
-    import joblib  # make sure it’s here
+    import joblib  
     data_dir  = "data"
     subjects  = ["P3"]
     bin_sizes = [1000, 500, 250]

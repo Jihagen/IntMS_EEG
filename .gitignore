@@ -4,4 +4,4 @@ results/
 *.pyc
 
 samples/
-data/
+data/*
