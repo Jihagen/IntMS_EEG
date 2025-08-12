@@ -5,3 +5,7 @@ results/
 
 samples/
 data/*
+results_xy/*
+
+z_legacy/*
+results_feat/*
