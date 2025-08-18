@@ -15,16 +15,119 @@ import joblib
 import itertools
 import matplotlib.pyplot as plt
 
-
 # =========================
-# Loading pre-extracted features
+# Binning augment — tuned to your file schema
+# Uses: data (C, T), ref_signal (T,)
+# Produces: emg_rms_matrix_binned_{bs}, ref_binned_{bs}, bin_size_{bs}, T_use_for_bins_{bs}
 # =========================
+AUTO_ADD_MISSING_BINS = True
+AUGMENT_BIN_SIZES = [500, 250]
 
-REQ_KEYS = ("emg_rms_matrix_binned", "ref_binned", "bin_size")
+import glob
+from pathlib import Path
 
-def load_feature_file(path):
+def _rms_bin_signal_matrix_from_CT(data_CT: np.ndarray, bin_size: int) -> tuple[np.ndarray, int]:
     """
-    Load a .npy/.npz region feature file and return:
+    data_CT: (C, T) -> returns (B, C) RMS per bin, and T_used
+    """
+    data_CT = np.asarray(data_CT, dtype=float)
+    if data_CT.ndim != 2:
+        raise ValueError(f"'data' must be 2D (C,T), got {data_CT.shape}")
+    C, T = data_CT.shape
+    n_bins = T // bin_size
+    if n_bins <= 0:
+        return np.empty((0, C), dtype=float), 0
+    T_used = n_bins * bin_size
+    # reshape per channel: (C, n_bins, bin_size) -> RMS over last axis
+    d = data_CT[:, :T_used].reshape(C, n_bins, bin_size)
+    rms = np.sqrt((d * d).mean(axis=2))          # (C, n_bins)
+    return rms.T, T_used                         # (B, C), T_used
+
+def _mean_bin_1d(y: np.ndarray, bin_size: int) -> tuple[np.ndarray, int]:
+    """
+    y: (T,) -> returns (B,), and T_used
+    """
+    y = np.asarray(y, dtype=float).reshape(-1)
+    n_bins = y.size // bin_size
+    if n_bins <= 0:
+        return np.array([], dtype=float), 0
+    T_used = n_bins * bin_size
+    yb = y[:T_used].reshape(n_bins, bin_size).mean(axis=1)
+    return yb, T_used
+
+def augment_folder_with_bins(feature_dir: Path, bin_sizes=(500, 250)):
+    paths = sorted(glob.glob(str(feature_dir / "*.npy"))) + sorted(glob.glob(str(feature_dir / "*.npz")))
+    if not paths:
+        print(f"[AUGMENT] No files in {feature_dir}")
+        return
+
+    for p in paths:
+        obj = np.load(p, allow_pickle=True)
+        # support npz and npy(pickled-dict)
+        if isinstance(obj, np.lib.npyio.NpzFile):
+            d = {k: obj[k] for k in obj.files}
+            container = "npz"
+        else:
+            try:
+                d = obj.item()
+                container = "npy"
+            except Exception:
+                print(f"[AUGMENT][SKIP] {Path(p).name}: not a pickled dict/npz")
+                continue
+
+        # your raw keys (from your dump)
+        if "data" not in d or "ref_signal" not in d:
+            print(f"[AUGMENT][SKIP] {Path(p).name}: missing 'data'/'ref_signal'")
+            continue
+
+        data_CT   = np.asarray(d["data"], dtype=float)          # (C, T)
+        ref_T     = np.asarray(d["ref_signal"], dtype=float)    # (T,)
+        changed = False
+
+        for bs in bin_sizes:
+            key_R   = f"emg_rms_matrix_binned_{bs}"
+            key_ref = f"ref_binned_{bs}"
+            key_bs  = f"bin_size_{bs}"
+            key_T   = f"T_use_for_bins_{bs}"
+
+            if key_R in d and key_ref in d:
+                continue  # already present
+
+            R_BC, T_used_sig = _rms_bin_signal_matrix_from_CT(data_CT, bs)
+            ref_B, T_used_ref = _mean_bin_1d(ref_T, bs)
+            # align just in case (should match)
+            B = min(R_BC.shape[0], ref_B.shape[0])
+            R_BC  = R_BC[:B, :]
+            ref_B = ref_B[:B]
+            T_used = min(T_used_sig, T_used_ref)
+
+            d[key_R]  = R_BC
+            d[key_ref]= ref_B
+            d[key_bs] = int(bs)
+            d[key_T]  = int(T_used)
+            changed = True
+            print(f"[AUGMENT][ADD] {Path(p).name}: +{bs} (bins={B}, C={R_BC.shape[1] if B>0 else 'n/a'})")
+
+        if changed:
+            if container == "npz":
+                np.savez(p, **d)
+            else:
+                np.save(p, d)
+
+    print("[AUGMENT] Completed.")
+
+
+# =========================
+# Loading pre-extracted features (now with bin-size selection)
+# =========================
+
+REQ_KEYS_BASE = ("emg_rms_matrix_binned", "ref_binned", "bin_size")
+
+def load_feature_file(path, target_bin_size: int | None):
+    """
+    Load a .npy/.npz region feature file for a specific bin size.
+
+    Returns:
       R  : (B, C)  per-bin RMS per channel
       y  : (B,)    per-bin reference (force) mean
       bin_size : int
@@ -36,16 +139,30 @@ def load_feature_file(path):
     else:
         d = obj.item() if hasattr(obj, "item") else obj
 
-    missing = [k for k in REQ_KEYS if k not in d]
-    if missing:
-        raise KeyError(f"{os.path.basename(path)} missing keys: {missing}")
-
-    R = np.asarray(d["emg_rms_matrix_binned"], dtype=float)  # (B,C)
-    y = np.asarray(d["ref_binned"], dtype=float).squeeze()   # (B,)
-    bs = int(np.asarray(d["bin_size"]).squeeze())
+    # Choose keys based on target_bin_size
+    if target_bin_size is None or target_bin_size == 1000:
+        if all(k in d for k in REQ_KEYS_BASE):
+            R = np.asarray(d["emg_rms_matrix_binned"], dtype=float)
+            y = np.asarray(d["ref_binned"], dtype=float).squeeze()
+            bs = int(np.asarray(d["bin_size"]).squeeze())
+        elif "emg_rms_matrix_binned_1000" in d and "ref_binned_1000" in d:
+            R = np.asarray(d["emg_rms_matrix_binned_1000"], dtype=float)
+            y = np.asarray(d["ref_binned_1000"], dtype=float).squeeze()
+            bs = int(d.get("bin_size_1000", 1000))
+        else:
+            raise KeyError(f"{os.path.basename(path)} missing 1000-bin keys")
+    else:
+        key_R   = f"emg_rms_matrix_binned_{target_bin_size}"
+        key_ref = f"ref_binned_{target_bin_size}"
+        key_bs  = f"bin_size_{target_bin_size}"
+        if key_R not in d or key_ref not in d:
+            raise KeyError(f"{os.path.basename(path)} missing keys for bin {target_bin_size}: {key_R}, {key_ref}")
+        R = np.asarray(d[key_R], dtype=float)
+        y = np.asarray(d[key_ref], dtype=float).squeeze()
+        bs = int(d.get(key_bs, target_bin_size))
 
     if R.ndim != 2:
-        raise ValueError(f"{path}: 'emg_rms_matrix_binned' must be 2D, got {R.shape}")
+        raise ValueError(f"{path}: 'emg_rms_matrix_binned*' must be 2D, got {R.shape}")
     if y.ndim != 1:
         y = y.reshape(-1)
     if R.shape[0] != y.shape[0]:
@@ -53,41 +170,45 @@ def load_feature_file(path):
         R = R[:B, :]
         y = y[:B]
 
-    meta = {k: d[k] for k in d.keys() if k not in ("emg_rms_matrix_binned", "ref_binned", "bin_size")}
+    if R.shape[0] == 0:
+        raise ValueError(f"{os.path.basename(path)} -> zero bins for bin_size={bs}")
+
+    # keep other keys as meta
+    base_and_this = set(REQ_KEYS_BASE) | {f"emg_rms_matrix_binned_{target_bin_size}",
+                                          f"ref_binned_{target_bin_size}",
+                                          f"bin_size_{target_bin_size}"}
+    meta = {k: d[k] for k in d.keys() if k not in base_and_this}
     return R, y, bs, meta
 
 
-def collect_dataset(feature_dir):
+def collect_dataset(feature_dir, target_bin_size: int | None):
     """
-    Scan folder for .npy/.npz feature files and aggregate by bin_size.
-    Returns dict: { bin_size : {"X": (N, C), "y": (N,), "files": [paths]} }
+    Scan folder and aggregate data for a specific target_bin_size.
+    Returns dict: { target_bin_size : {"X": (N, C), "y": (N,), "files": [paths]} }
     """
     files = sorted(glob.glob(os.path.join(feature_dir, "*.npy")) +
                    glob.glob(os.path.join(feature_dir, "*.npz")))
     if not files:
         raise FileNotFoundError(f"No .npy/.npz files in {feature_dir}")
 
-    buckets = {}
+    X_list, y_list, used = [], [], []
     for p in files:
         try:
-            R, y, bs, _ = load_feature_file(p)
+            R, y, bs, _ = load_feature_file(p, target_bin_size=target_bin_size)
+            X_list.append(R)
+            y_list.append(y)
+            used.append(p)
         except Exception as e:
             print(f"[SKIP] {os.path.basename(p)} -> {e}")
             continue
-        if bs not in buckets:
-            buckets[bs] = {"X": [], "y": [], "files": []}
-        buckets[bs]["X"].append(R)
-        buckets[bs]["y"].append(y)
-        buckets[bs]["files"].append(p)
 
-    for bs in list(buckets.keys()):
-        X = np.vstack(buckets[bs]["X"])
-        y = np.concatenate(buckets[bs]["y"])
-        buckets[bs]["X"] = X
-        buckets[bs]["y"] = y
-        print(f"[LOAD] bin_size={bs}: X={X.shape}, y={y.shape}, files={len(buckets[bs]['files'])}")
-    return buckets
+    if not X_list:
+        raise RuntimeError(f"No usable files for bin_size={target_bin_size} in {feature_dir}")
 
+    X = np.vstack(X_list)
+    y = np.concatenate(y_list)
+    print(f"[LOAD] bin_size={target_bin_size}: X={X.shape}, y={y.shape}, files={len(used)}")
+    return {int(target_bin_size if target_bin_size is not None else 1000): {"X": X, "y": y, "files": used}}
 
 # =========================
 # Feature assembly (modes)
@@ -111,20 +232,15 @@ def build_X(R, mode, channels=None):
     if mode == "iterative_addition":
         if channels is None:
             channels = list(range(R.shape[1]))
-        # Returns a list of X_k with 1..K channels included
         X_list = [R[:, channels[:k]] for k in range(1, len(channels)+1)]
         return X_list
     raise ValueError(f"Unknown mode: {mode}")
-
 
 # =========================
 # Cross-val experiments
 # =========================
 
 def cv_scores(X, y, cv=5, use_scaler=True):
-    """
-    Get CV MSE/MAE for a single design matrix X and target y.
-    """
     if use_scaler:
         model = Pipeline([("scaler", StandardScaler(with_mean=True, with_std=True)),
                           ("ridge", Ridge())])
@@ -135,15 +251,7 @@ def cv_scores(X, y, cv=5, use_scaler=True):
     mae = -np.mean(cross_val_score(model, X, y, cv=cv, scoring="neg_mean_absolute_error"))
     return mse, mae
 
-
 def run_modes(X, y, channel_modes, cv=5, use_scaler=True):
-    """
-    channel_modes: list of dicts like
-      {'name':'all_channels', 'mode':'all_channels'}
-      {'name':'single_ch_0', 'mode':'single_channel', 'channels':[0]}
-      {'name':'iterative_add', 'mode':'iterative_addition', 'channels':[0,1,...]}
-      {'name':'rms_matrix', 'mode':'rms_matrix'}
-    """
     results = {}
     for cfg in channel_modes:
         name, mode = cfg["name"], cfg["mode"]
@@ -165,7 +273,6 @@ def run_modes(X, y, channel_modes, cv=5, use_scaler=True):
             results[name] = {"mse": mse, "mae": mae}
     return results
 
-
 # =========================
 # Train final models & save
 # =========================
@@ -177,7 +284,6 @@ def train_and_save_models(X, y, channel_modes, out_dir, use_scaler=True):
         name, mode = cfg["name"], cfg["mode"]
         chs = cfg.get("channels")
         if mode == "iterative_addition":
-            # Train separate models for each prefix length
             X_list = build_X(X, mode, chs)
             for k, Xk in enumerate(X_list, start=1):
                 model = Pipeline([("scaler", StandardScaler()), ("ridge", Ridge())]) if use_scaler else Ridge()
@@ -195,12 +301,11 @@ def train_and_save_models(X, y, channel_modes, out_dir, use_scaler=True):
     print(f"[SAVE] Saved {len(saved)} models into {out_dir}")
     return saved
 
-
 # =========================
 # Save results CSV
 # =========================
 
-def save_results(results, out_dir, tag="results"):
+def save_results(results, out_dir, tag="metrics"):
     rows = []
     for name, res in results.items():
         if isinstance(res.get("mae"), list):
@@ -215,15 +320,11 @@ def save_results(results, out_dir, tag="results"):
     print(f"[SAVE] Wrote {out_csv} ({df.shape[0]} rows)")
     return df
 
-
 # =========================
 # Optional: quick reconstruction plot (CV predict)
 # =========================
 
 def plot_cv_reconstruction(X, y, cfg, out_path, cv=5, use_scaler=True, bin_size=None):
-    """
-    One visual check: CV prediction vs true target for a given mode.
-    """
     name, mode = cfg["name"], cfg["mode"]
     chs = cfg.get("channels")
     Xd = build_X(X, mode, chs)
@@ -244,51 +345,58 @@ def plot_cv_reconstruction(X, y, cfg, out_path, cv=5, use_scaler=True, bin_size=
     plt.close()
     print(f"[PLOT] {out_path}")
 
-
 # =========================
 # Main
 # =========================
 
 def main():
-    FEATURE_DIR = "data/preprocessing/P3_prp_feat"  # <- your folder
-    OUT_ROOT    = "./results_feat/P3"
+    # Adjust patient/folder here
+    FEATURE_DIR = Path("data/preprocessing/P5_prp_feat")
+    OUT_ROOT    = Path("./results_feat/P5")
     CV_FOLDS    = 5
-    USE_SCALER  = True  # Standardize inputs inside Ridge (recommended)
+    USE_SCALER  = True
+    BIN_SIZES   = [1000, 500, 250]
 
-    buckets = collect_dataset(FEATURE_DIR)
-    for bin_size, bundle in buckets.items():
+    # 0) Augment files in-place with 500/250 if missing
+    if AUTO_ADD_MISSING_BINS:
+        augment_folder_with_bins(FEATURE_DIR, AUGMENT_BIN_SIZES)
+
+    # 1) Loop experiments per bin size
+    for target_bin in BIN_SIZES:
+        print(f"\n[RUN] bin_size={target_bin}")
+        buckets = collect_dataset(FEATURE_DIR, target_bin_size=target_bin)
+        bundle = buckets[target_bin]
         X, y = bundle["X"], bundle["y"]
-        out_dir = os.path.join(OUT_ROOT, f"bin_{bin_size}")
-        os.makedirs(out_dir, exist_ok=True)
-        print(f"\n[RUN] bin_size={bin_size} -> X={X.shape}, y={y.shape}")
 
-        # Define modes (feel free to customize)
+        out_dir = OUT_ROOT / f"bin_{target_bin}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Define modes
         n_ch = X.shape[1]
         channel_modes = [
-            {"name": "rms_matrix",      "mode": "rms_matrix"},
-            {"name": "all_channels",    "mode": "all_channels"},
-            {"name": "average_channels","mode": "average_channels"},
-            {"name": "single_channel_0","mode": "single_channel", "channels": [0]},
-            {"name": "iterative_add",   "mode": "iterative_addition", "channels": list(range(n_ch))},
+            {"name": "rms_matrix",       "mode": "rms_matrix"},
+            {"name": "all_channels",     "mode": "all_channels"},
+            {"name": "average_channels", "mode": "average_channels"},
+            {"name": "single_channel_0", "mode": "single_channel", "channels": [0]},
+            {"name": "iterative_add",    "mode": "iterative_addition", "channels": list(range(n_ch))},
         ]
 
         # 1) Cross-val experiments
         results = run_modes(X, y, channel_modes, cv=CV_FOLDS, use_scaler=USE_SCALER)
-        df = save_results(results, out_dir, tag="metrics")
+        _ = save_results(results, out_dir, tag="metrics")
 
         # 2) Train final models and save
-        _saved = train_and_save_models(X, y, channel_modes, out_dir, use_scaler=USE_SCALER)
+        _ = train_and_save_models(X, y, channel_modes, out_dir, use_scaler=USE_SCALER)
 
-        # 3) Optional: one reconstruction plot for a chosen mode
+        # 3) Optional: quick CV reconstruction plot
         plot_cv_reconstruction(
             X, y,
             cfg={"name": "rms_matrix", "mode": "rms_matrix"},
-            out_path=os.path.join(out_dir, "cv_reconstruction_rms_matrix.png"),
-            cv=CV_FOLDS, use_scaler=USE_SCALER, bin_size=bin_size
+            out_path=str(out_dir / "cv_reconstruction_rms_matrix.png"),
+            cv=CV_FOLDS, use_scaler=USE_SCALER, bin_size=target_bin
         )
 
     print("\n[DONE] All bin sizes processed.")
-
 
 if __name__ == "__main__":
     main()
