@@ -75,6 +75,7 @@ def collect_dataset_from_combined(
     modes=("rms_matrix",),            # we feed rms_matrix to dataset; other modes are tested later
     single_channel_idx=None,
     iterative_channels=None,
+    segment_kind: str = "plateau",
 ):
     """
     Returns buckets keyed by bin_len (samples):
@@ -104,7 +105,8 @@ def collect_dataset_from_combined(
             modes=modes,
             single_channel_idx=single_channel_idx,
             iterative_channels=iterative_channels,
-            keep_intended_angle=False
+            keep_intended_angle=False,
+            segment_kind=segment_kind, 
         )
 
         segs = pp.get("segments", [])
@@ -378,6 +380,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--feature-dir", default="data/preprocessing/P5_combined",
                     help="Folder/file/glob for *_combined.npy files")
+    ap.add_argument("--kind", default="plateau", help="Segment kind to use from 'cuts' entries (e.g., 'plateau', 'ramp')")
     ap.add_argument("--out-root", default="./results_feat/P5_angle")
     ap.add_argument("--cv", type=int, default=5)
     ap.add_argument("--bin-sec", type=float, default=0.050, help="Bin size in seconds (e.g., 0.05)")
@@ -389,6 +392,7 @@ def main():
     args = ap.parse_args()
 
     FEATURE_DIR = args.feature_dir
+    KIND = args.kind
     OUT_ROOT    = args.out_root
     CV_FOLDS    = args.cv
     BIN_SEC     = args.bin_sec
@@ -405,6 +409,7 @@ def main():
         include_angle_target=INCLUDE_ANGLE_TARGET,
         rms_win_samples=RMS_WIN,
         modes=("rms_matrix",),
+        segment_kind=KIND,
     )
 
     for bin_len, bundle in buckets.items():

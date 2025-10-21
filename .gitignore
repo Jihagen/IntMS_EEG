@@ -4,7 +4,9 @@ results/
 *.pyc
 
 samples/
-data/*
+data/preprocessing/P3_combined/*
+data/preprocessing/P5_combined/*
+
 results_xy/*
 
 z_legacy/*
