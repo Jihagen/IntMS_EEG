@@ -416,6 +416,13 @@ def main():
         X, y, groups = bundle["X"], bundle["y"], bundle["groups"]
         angles_per_row = bundle["angles"] if y.shape[1] < 3 else y[:, 2]
 
+
+        # choose the target(s) you want: 
+        # outcomment all if Fx, Fy & angle
+        y = y[:, [2]]   # angle-only   (Fx=0, Fy=1, Angle=2)
+        # y = y[:, [0]] # Fx-only
+        # y = y[:, [1]] # Fy-only
+
         out_dir = _resolve_path(os.path.join(OUT_ROOT, f"bin_{bin_len}"))
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n[RUN] bin_len={bin_len} -> X={X.shape}, y={y.shape} | unique groups={len(np.unique(groups))}")
