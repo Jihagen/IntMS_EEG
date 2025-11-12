@@ -10,9 +10,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from data.preprocessing.preprocess import preprocess_plateaus  # preprocessor
 from experiments_xy import (
-    collect_dataset_from_combined,   # builds X,y,groups from *_combined.npy
-    build_X,                         # shapes features by mode name
-)
+    collect_dataset_from_combined,   # builds X,y,groups from *_combined.npy 
+) 
 
 
 def _load_metrics_for_bin(bin_dir: Path, metric_col: str,

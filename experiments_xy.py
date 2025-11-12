@@ -1,10 +1,11 @@
+
+
+# -------------------- Path helpers --------------------
 # angle_experiments/experiments_xy.py
-# New pipeline: read *_combined.npy, preprocess into plateau segments, bin, split by groups.
+# Pipeline: read *_combined.npy, preprocess into segments, bin, then split by MCP angle groups.
 
 import os
 import glob
-import math
-import re
 from pathlib import Path
 from collections import defaultdict
 
@@ -27,9 +28,9 @@ def _resolve_path(p: str) -> Path:
     q = Path(p).expanduser()
     return q if q.is_absolute() else (SCRIPT_DIR / q).resolve()
 
-# -------------------- Loader from *_combined.npy via preprocess_plateaus --------------------
+# -------------------- Preprocessor --------------------
 
-from data.preprocessing.preprocess import preprocess_plateaus  # <-- your preprocessor
+from data.preprocessing.preprocess import preprocess_plateaus  # your preprocessor
 
 def _expand_combined_files(dir_or_glob: str):
     p = _resolve_path(dir_or_glob)
@@ -67,21 +68,35 @@ def _bin_series(arr, bin_len, agg="mean"):
 def _samples_per_bin_from_seconds(fs, bin_sec):
     return max(1, int(round(fs * float(bin_sec))))
 
+# -------------------- Dataset collector --------------------
+
 def collect_dataset_from_combined(
     combined_dir_or_glob: str,
-    bin_sec: float = 0.050,           # 50 ms bins
+    bin_sec: float = 0.050,            # 50 ms
     include_angle_target: bool = True,
-    rms_win_samples: int = 100,       # RMS window on the common grid
-    modes=("rms_matrix",),            # we feed rms_matrix to dataset; other modes are tested later
+    rms_win_samples: int = 100,        # RMS window on native grid
+    modes=("rms_matrix", "all_channels", "average_channels", "iterative_addition"),
     single_channel_idx=None,
     iterative_channels=None,
     segment_kind: str = "plateau",
 ):
     """
-    Returns buckets keyed by bin_len (samples):
-      buckets[bin_len] = {"X": (sum_B,C), "y": (sum_B,2/3), "files": [...], "groups": (sum_B,), "angles": (sum_B,)}
-      - groups: string ID per row -> 'path/to/file.npy::plateau01'
-      - angles: angle label per row (deg), averaged per bin (for diagnostics)
+    Returns dict keyed by bin_len (samples). For each bin_len:
+
+      buckets[bin_len] = {
+        "X_by_mode": {
+           "rms_matrix":        (sum_B, C),
+           "all_channels":      (sum_B, 1),
+           "average_channels":  (sum_B, 1),
+           "single_channel":    (sum_B, 1),              # if requested
+           "iterative_addition": [ (sum_B,1), ... ]      # list over k
+        },
+        "y": (sum_B, 2/3),                 # Fx, Fy, [Angle]
+        "groups": (sum_B,),                # 'path/file.npy::plateau01'
+        "angles": (sum_B,),                # achieved angle (binned mean)
+        "nominal_angles": (sum_B,),        # MCP_angle replicated per row
+        "files": [...],
+      }
     """
     files = _expand_combined_files(combined_dir_or_glob)
     print(f"[PATH] combined-dir: {combined_dir_or_glob} -> resolved: {_resolve_path(combined_dir_or_glob)}")
@@ -106,99 +121,129 @@ def collect_dataset_from_combined(
             single_channel_idx=single_channel_idx,
             iterative_channels=iterative_channels,
             keep_intended_angle=False,
-            segment_kind=segment_kind, 
+            segment_kind=segment_kind,
         )
-
         segs = pp.get("segments", [])
         if not segs:
-            print(f"[SKIP] {Path(f).name} -> no plateaus found")
+            print(f"[SKIP] {Path(f).name} -> no segments found (kind={segment_kind})")
             continue
 
         # fs + bin
         fs = segs[0]["fs"] or (1.0 / np.median(np.diff(segs[0]["signals"]["t"])))
         bin_len = _samples_per_bin_from_seconds(fs, bin_sec)
 
-        for seg in segs:  # plateau01 / plateau23
-            R = seg["emg"]["rms_matrix"]             # (N,C)
-            Fx = seg["signals"]["Fx"].reshape(-1)
-            Fy = seg["signals"]["Fy"].reshape(-1)
+        # nominal (intended) MCP angle for the trial
+        try:
+            mcp_angle = int(payload["MCP_Angle"])
+        except Exception:
+            mcp_angle = np.nan
 
-            # Equalize length
-            N = min(R.shape[0], Fx.size, Fy.size)
-            R, Fx, Fy = R[:N, :], Fx[:N], Fy[:N]
+        for seg in segs:
+            # core signals from preprocessor
+            Fx  = seg["signals"]["Fx"].reshape(-1)
+            Fy  = seg["signals"]["Fy"].reshape(-1)
+            ang = seg["signals"]["angle_achieved"].reshape(-1)  # [0,360)
 
-            # Angle timeseries (achieved): from Fx,Fy (deg in [0,360))
-            ang_ts = np.degrees(np.arctan2(Fy, Fx))
-            ang_ts = np.where(ang_ts < 0, ang_ts + 360.0, ang_ts)
+            # defensive equalization on native grid (use rms_matrix as reference)
+            R_native = seg["emg"]["rms_matrix"]
+            N = min(R_native.shape[0], Fx.size, Fy.size, ang.size)
+            Fx, Fy, ang = Fx[:N], Fy[:N], ang[:N]
 
-            # Bin
-            Rb   = _bin_series(R,   bin_len, agg="mean")           # (B,C)
-            Fxb  = _bin_series(Fx,  bin_len, agg="mean").reshape(-1,1)
-            Fyb  = _bin_series(Fy,  bin_len, agg="mean").reshape(-1,1)
-            Angb = _bin_series(ang_ts, bin_len, agg="mean").reshape(-1,1)
+            # --- bin y-targets
+            Fxb  = _bin_series(Fx,  bin_len, agg="mean").reshape(-1, 1)
+            Fyb  = _bin_series(Fy,  bin_len, agg="mean").reshape(-1, 1)
+            Angb = _bin_series(ang, bin_len, agg="mean").reshape(-1, 1)
+            yb   = np.hstack([Fxb, Fyb, Angb]) if include_angle_target else np.hstack([Fxb, Fyb])
 
-            if include_angle_target:
-                yb = np.hstack([Fxb, Fyb, Angb])                   # (B,3)
-            else:
-                yb = np.hstack([Fxb, Fyb])                         # (B,2)
+            # --- bin each requested EMG mode from seg["emg"]
+            X_modes_binned = {}
 
-            # Defensive trim
-            B = min(Rb.shape[0], yb.shape[0])
-            Rb, yb, Angb = Rb[:B, :], yb[:B, :], Angb[:B, 0]
+            # Helper: bin a mode array with the same logic and trim to B
+            def _bin_and_trim(arr, B=None):
+                out = _bin_series(arr, bin_len, agg="mean")
+                if out.ndim == 1:
+                    out = out.reshape(-1, 1)
+                return out if B is None else out[:B, ...]
 
-            # Group label for this segment (keep all its bins together)
+            # First, compute B by binning one reference (rms_matrix)
+            Rb_ref = _bin_and_trim(R_native)
+            B = min(Rb_ref.shape[0], yb.shape[0])
+
+            # Now fill modes
+            for mode in set(modes or []):
+                if mode not in seg["emg"]:
+                    continue
+                val = seg["emg"][mode]
+                if mode == "iterative_addition":
+                    # list of (N,1) -> list of (B,1)
+                    X_modes_binned[mode] = [ _bin_and_trim(v, B) for v in val ]
+                else:
+                    X_modes_binned[mode] = _bin_and_trim(val, B)
+
+            # final trim of y + angles to B
+            yb   = yb[:B, :]
+            Angb = Angb[:B, 0]
+
+            # group label + MCP vector
             group_label = f"{f}::{seg['name']}"
-            groups_seg = np.full((B,), group_label, dtype=object)
+            groups_seg  = np.full((B,), group_label, dtype=object)
+            nom_seg     = np.full((B,), mcp_angle, dtype=float)
 
             key = int(bin_len)
-            buckets.setdefault(key, {"X": [], "y": [], "files": [], "groups": [], "angles": []})
-            buckets[key]["X"].append(Rb)
+            if key not in buckets:
+                buckets[key] = {
+                    "X_by_mode": defaultdict(list),
+                    "y": [], "groups": [], "angles": [], "nominal_angles": [], "files": []
+                }
+
+            # append per-mode
+            for mode, Xb in X_modes_binned.items():
+                buckets[key]["X_by_mode"][mode].append(Xb)
             buckets[key]["y"].append(yb)
-            buckets[key]["files"].append(group_label)
             buckets[key]["groups"].append(groups_seg)
             buckets[key]["angles"].append(Angb)
+            buckets[key]["nominal_angles"].append(nom_seg)
+            buckets[key]["files"].append(group_label)
 
         used_files += 1
 
     # Stack lists
-    for key in list(buckets.keys()):
-        X = np.vstack(buckets[key]["X"]) if buckets[key]["X"] else np.empty((0,0))
-        y = np.vstack(buckets[key]["y"]) if buckets[key]["y"] else np.empty((0,0))
-        groups = np.concatenate(buckets[key]["groups"]) if buckets[key]["groups"] else np.array([], dtype=object)
-        angles = np.concatenate(buckets[key]["angles"]) if buckets[key]["angles"] else np.array([], dtype=float)
-        buckets[key]["X"], buckets[key]["y"], buckets[key]["groups"], buckets[key]["angles"] = X, y, groups, angles
-        approx_sec = (key / fs) if 'fs' in locals() and fs else float('nan')
-        print(f"[LOAD] bin_len={key} (~{approx_sec:.3f}s): X={X.shape}, y={y.shape}, groups={len(np.unique(groups))}")
+    for key, pack in buckets.items():
+        # stack y, groups, angles, nominal
+        y = np.vstack(pack["y"]) if pack["y"] else np.empty((0, 0))
+        groups = np.concatenate(pack["groups"]) if pack["groups"] else np.array([], dtype=object)
+        angles = np.concatenate(pack["angles"]) if pack["angles"] else np.array([], dtype=float)
+        nomang = np.concatenate(pack["nominal_angles"]) if pack["nominal_angles"] else np.array([], dtype=float)
+
+        # stack each mode
+        X_by_mode = {}
+        for mode, chunks in pack["X_by_mode"].items():
+            if mode == "iterative_addition":
+                # chunks is a list over segments; each item is a list over k -> we need to stack per k
+                # Collect by k index first
+                by_k = defaultdict(list)
+                for seg_list in chunks:  # seg_list is [ (B,1), (B,1), ... ]
+                    for k_idx, arr in enumerate(seg_list):
+                        by_k[k_idx].append(arr)
+                # stack each k
+                X_by_mode[mode] = [ np.vstack(lst) if lst else np.empty((0,1)) for k_idx, lst in sorted(by_k.items()) ]
+            else:
+                X_by_mode[mode] = np.vstack(chunks) if chunks else np.empty((0, 0))
+
+        buckets[key] = {
+            "X_by_mode": X_by_mode,
+            "y": y,
+            "groups": groups,
+            "angles": angles,
+            "nominal_angles": nomang,
+            "files": pack["files"],
+        }
+
+        approx_sec = (key / _samples_per_bin_from_seconds(1.0, 1.0))  # just placeholder for printing
+        print(f"[LOAD] bin_len={key}: X_by_mode keys={list(X_by_mode.keys())}, y={y.shape}, groups={len(np.unique(groups))}")
+
     print(f"[DONE] processed files: {used_files}/{len(files)}")
     return buckets
-
-# -------------------- Feature modes (unchanged) --------------------
-
-def build_X(R, mode, channels=None):
-    """
-    R: (N, C)
-    modes:
-      - rms_matrix: all channels (N,C)
-      - all_channels: RMS across channels (N,1)
-      - average_channels: mean across channels (N,1)
-      - single_channel: channels=[i] -> (N,1)
-      - iterative_addition: channels=list -> [ (N,1), (N,2), ... ]
-    """
-    if mode == "rms_matrix":
-        return R
-    if mode == "all_channels":
-        return np.sqrt(np.mean(R**2, axis=1, keepdims=True))
-    if mode == "average_channels":
-        return R.mean(axis=1, keepdims=True)
-    if mode == "single_channel":
-        if not channels or len(channels) != 1:
-            raise ValueError("Provide channels=[idx] for single_channel")
-        return R[:, [channels[0]]]
-    if mode == "iterative_addition":
-        if channels is None:
-            channels = list(range(R.shape[1]))
-        return [R[:, channels[:k]] for k in range(1, len(channels)+1)]
-    raise ValueError(f"Unknown mode: {mode}")
 
 # -------------------- Group-aware CV helpers --------------------
 
@@ -211,7 +256,8 @@ def cv_scores_multi(X, y, groups=None, cv=5, use_scaler=True):
     mae = -np.mean(cross_val_score(model, X, y, cv=splitter, groups=groups, scoring="neg_mean_absolute_error"))
     return mse, mae
 
-def run_modes(X, y, groups, channel_modes, cv=5, use_scaler=True, scale_targets=True):
+def run_modes(X_by_mode, y, groups, modes_to_eval, cv=5, use_scaler=True, scale_targets=True):
+    # optionally scale targets (shared for all modes)
     if scale_targets:
         y_scaler = MinMaxScaler()
         y_used = y_scaler.fit_transform(y)
@@ -220,13 +266,13 @@ def run_modes(X, y, groups, channel_modes, cv=5, use_scaler=True, scale_targets=
         y_used = y
 
     results = {}
-    for cfg in channel_modes:
-        name, mode = cfg["name"], cfg["mode"]
-        chs = cfg.get("channels")
-        print(f"[EXP] {name} ({mode}) channels={chs}")
+    for entry in modes_to_eval:
+        name = entry["name"]
+        mode = entry["mode"]
+        print(f"[EXP] {name} ({mode})")
 
         if mode == "iterative_addition":
-            X_list = build_X(X, mode, chs)
+            X_list = X_by_mode.get("iterative_addition", [])
             mses, maes = [], []
             for k, Xk in enumerate(X_list, start=1):
                 mse, mae = cv_scores_multi(Xk, y_used, groups=groups, cv=cv, use_scaler=use_scaler)
@@ -234,44 +280,16 @@ def run_modes(X, y, groups, channel_modes, cv=5, use_scaler=True, scale_targets=
                 print(f"      k={k}: MSE={mse:.4f}, MAE={mae:.4f}")
             results[name] = {"mse": mses, "mae": maes}
         else:
-            Xd = build_X(X, mode, chs)
+            Xd = X_by_mode.get(mode)
+            if Xd is None:
+                print(f"      [WARN] Mode '{mode}' not available; skipping.")
+                continue
             mse, mae = cv_scores_multi(Xd, y_used, groups=groups, cv=cv, use_scaler=use_scaler)
             print(f"      MSE={mse:.4f}, MAE={mae:.4f}")
             results[name] = {"mse": mse, "mae": mae}
     return results
 
-# -------------------- Train & save (unchanged) --------------------
-
-def train_and_save_models(X, y, channel_modes, out_dir, use_scaler=True, scale_targets=True):
-    os.makedirs(out_dir, exist_ok=True)
-    y_scaler = MinMaxScaler() if scale_targets else None
-    y_train = y_scaler.fit_transform(y) if y_scaler else y
-
-    saved = []
-    for cfg in channel_modes:
-        name, mode, chs = cfg["name"], cfg["mode"], cfg.get("channels")
-        if mode == "iterative_addition":
-            X_list = build_X(X, mode, chs)
-            for k, Xk in enumerate(X_list, start=1):
-                base = MultiOutputRegressor(Ridge())
-                model = Pipeline([("xscale", StandardScaler()), ("ridge", base)]) if use_scaler else base
-                model.fit(Xk, y_train)
-                path = os.path.join(out_dir, f"ridge_{name}_k{k}.joblib")
-                joblib.dump(model, path); saved.append(path)
-        else:
-            Xd = build_X(X, mode, chs)
-            base = MultiOutputRegressor(Ridge())
-            model = Pipeline([("xscale", StandardScaler()), ("ridge", base)]) if use_scaler else base
-            model.fit(Xd, y_train)
-            path = os.path.join(out_dir, f"ridge_{name}.joblib")
-            joblib.dump(model, path); saved.append(path)
-
-    if y_scaler:
-        joblib.dump(y_scaler, os.path.join(out_dir, "y_scaler.joblib"))
-    print(f"[SAVE] Saved {len(saved)} models into {out_dir}")
-    return saved
-
-# -------------------- Save results CSV --------------------
+# -------------------- Train & save --------------------
 
 def save_results(results, out_dir, tag="metrics"):
     rows = []
@@ -288,11 +306,44 @@ def save_results(results, out_dir, tag="metrics"):
     print(f"[SAVE] Wrote {out_csv} ({df.shape[0]} rows)")
     return df
 
-# -------------------- Diagnostic plot (unchanged logic) --------------------
 
-def plot_cv_reconstruction(X, y, cfg, out_path, cv=5, use_scaler=True, scale_targets=True, bin_size=None):
-    name, mode, chs = cfg["name"], cfg["mode"], cfg.get("channels")
-    Xd = build_X(X, mode, chs)
+def train_and_save_models(X_by_mode, y, modes_to_train, out_dir, use_scaler=True, scale_targets=True):
+    os.makedirs(out_dir, exist_ok=True)
+    y_scaler = MinMaxScaler() if scale_targets else None
+    y_train = y_scaler.fit_transform(y) if y_scaler else y
+
+    saved = []
+    for entry in modes_to_train:
+        name, mode = entry["name"], entry["mode"]
+
+        if mode == "iterative_addition":
+            X_list = X_by_mode.get("iterative_addition", [])
+            for k, Xk in enumerate(X_list, start=1):
+                base = MultiOutputRegressor(Ridge())
+                model = Pipeline([("xscale", StandardScaler()), ("ridge", base)]) if use_scaler else base
+                model.fit(Xk, y_train)
+                path = os.path.join(out_dir, f"ridge_{name}_k{k}.joblib")
+                joblib.dump(model, path); saved.append(path)
+        else:
+            Xd = X_by_mode.get(mode)
+            if Xd is None:
+                print(f"[WARN] Mode '{mode}' not available; skipping train.")
+                continue
+            base = MultiOutputRegressor(Ridge())
+            model = Pipeline([("xscale", StandardScaler()), ("ridge", base)]) if use_scaler else base
+            model.fit(Xd, y_train)
+            path = os.path.join(out_dir, f"ridge_{name}.joblib")
+            joblib.dump(model, path); saved.append(path)
+
+    if y_scaler:
+        joblib.dump(y_scaler, os.path.join(out_dir, "y_scaler.joblib"))
+    print(f"[SAVE] Saved {len(saved)} models into {out_dir}")
+    return saved
+
+# -------------------- Diagnostic plot (works for 2-dim targets only) --------------------
+
+def plot_cv_reconstruction(Xd, y, cfg, out_path, cv=5, use_scaler=True, scale_targets=True, bin_size=None):
+    name, mode = cfg["name"], cfg["mode"]
 
     y_scaler = MinMaxScaler() if scale_targets else None
     y_used = y_scaler.fit_transform(y) if y_scaler else y
@@ -322,49 +373,34 @@ def plot_cv_reconstruction(X, y, cfg, out_path, cv=5, use_scaler=True, scale_tar
     diff = (ang_pred - ang_true + 180) % 360 - 180
     print(f"[ANGLE] CV angle MAE (deg) from Fx/Fy: {np.mean(np.abs(diff)):.2f}")
 
-# -------------------- Grouped holdout: one plateau per *nominal* angle --------------------
+# -------------------- Grouped holdout via MCP_angle --------------------
 
-def nominal_angle_from_path(p: str) -> float:
+def split_one_plateau_per_angle_test(groups, nominal_angles, rng=42):
     """
-    Parse the intended/nominal angle from the combined file name.
-    Accepts either a '<num>Deg' token or a leading number before '_'.
-    Examples: '90Deg_F2_1_combined.npy' -> 90, '135_F1_2_combined.npy' -> 135
-    """
-    base = Path(p).stem
-    m = re.search(r'([+-]?\d+(?:\.\d+)?)\s*deg', base, flags=re.IGNORECASE)
-    if m:
-        return float(m.group(1))
-    first = base.split('_', 1)[0]
-    m = re.match(r'^\s*([+-]?\d+(?:\.\d+)?)', first)
-    if m:
-        return float(m.group(1))
-    raise ValueError(f"Cannot parse nominal angle from: {p}")
-
-def split_one_plateau_per_angle_test(groups, rng=42):
-    """
-    groups are strings: '.../90Deg_F2_1_combined.npy::plateau01'
-    We parse the nominal angle from the part before '::', bucket plateaus by that,
-    and pick exactly one plateau per angle bucket as test.
+    Pick exactly one plateau group per nominal angle (from MCP_angle).
+    Inputs are aligned 1:1 per-row arrays: groups, nominal_angles.
     """
     rnd = np.random.RandomState(rng)
-
-    # 1) rows per group
+    # rows per group
     group_to_rows = defaultdict(list)
     for i, g in enumerate(groups):
         group_to_rows[g].append(i)
-    group_to_rows = {g: np.asarray(ix, dtype=int) for g, ix in group_to_rows.items()}
 
-    # 2) parse nominal angle per group
+    # nominal angle per group (they should all be identical per group)
+    group_nom = {}
+    for g, idxs in group_to_rows.items():
+        vals = np.asarray(nominal_angles)[idxs]
+        group_nom[g] = float(np.nanmean(vals))
+
+    # bucket groups by nominal angle
     angle_to_groups = defaultdict(list)
-    for g in group_to_rows:
-        src_path = g.split("::", 1)[0]
-        ang_nom = nominal_angle_from_path(src_path)
-        angle_to_groups[ang_nom].append(g)
+    for g, ang in group_nom.items():
+        angle_to_groups[ang].append(g)
 
-    # 3) pick one group per nominal angle
+    # pick one group per nominal angle for test
     test_groups = [rnd.choice(glist) for glist in angle_to_groups.values()]
 
-    # 4) rows -> indices
+    # mask rows
     test_mask = np.zeros(len(groups), dtype=bool)
     for g in test_groups:
         test_mask[group_to_rows[g]] = True
@@ -384,11 +420,14 @@ def main():
     ap.add_argument("--out-root", default="./results_feat/P5_angle")
     ap.add_argument("--cv", type=int, default=5)
     ap.add_argument("--bin-sec", type=float, default=0.050, help="Bin size in seconds (e.g., 0.05)")
-    ap.add_argument("--rms-win", type=int, default=100, help="RMS window (samples) on common time grid")
+    ap.add_argument("--rms-win", type=int, default=100, help="RMS window (samples) on native time grid")
     ap.add_argument("--no-x-scaler", action="store_true", help="Disable StandardScaler on X")
     ap.add_argument("--no-y-scaler", action="store_true", help="Disable MinMaxScaler on y")
     ap.add_argument("--no-angle-target", action="store_true", help="Do not include angle as 3rd output")
     ap.add_argument("--random-state", type=int, default=42)
+    # optional: if you want single_channel or a custom channel order for iterative
+    ap.add_argument("--single-channel-idx", type=int, default=None)
+    ap.add_argument("--iterative-channels", type=str, default=None, help="comma-separated indices, e.g. 0,1,2,3")
     args = ap.parse_args()
 
     FEATURE_DIR = args.feature_dir
@@ -402,64 +441,84 @@ def main():
     INCLUDE_ANGLE_TARGET = not args.no_angle_target
     RNG         = args.random_state
 
-    # Build dataset from combined files (two plateaus per file)
+    it_channels = None
+    if args.iterative_channels:
+        it_channels = [int(s) for s in args.iterative_channels.split(",") if s.strip()]
+
+    MODES_REQUESTED = ("rms_matrix", "all_channels", "average_channels", "iterative_addition")
+
+    # Build dataset from combined files (once; includes all requested modes)
     buckets = collect_dataset_from_combined(
         FEATURE_DIR,
         bin_sec=BIN_SEC,
         include_angle_target=INCLUDE_ANGLE_TARGET,
         rms_win_samples=RMS_WIN,
-        modes=("rms_matrix",),
+        modes=MODES_REQUESTED,
+        single_channel_idx=args.single_channel_idx,
+        iterative_channels=it_channels,
         segment_kind=KIND,
     )
 
     for bin_len, bundle in buckets.items():
-        X, y, groups = bundle["X"], bundle["y"], bundle["groups"]
-        angles_per_row = bundle["angles"] if y.shape[1] < 3 else y[:, 2]
+        X_by_mode = bundle["X_by_mode"]
+        y, groups = bundle["y"], bundle["groups"]
+        nominal_angles = bundle["nominal_angles"]
 
-
-        # choose the target(s) you want: 
-        # outcomment all if Fx, Fy & angle
-        y = y[:, [2]]   # angle-only   (Fx=0, Fy=1, Angle=2)
+        ################################################
+        # TARGET CHOICES (select one)
+        ################################################
+        # Angle-only   (Fx=0, Fy=1, Angle=2)
+        y = y[:, [2]]
         # y = y[:, [0]] # Fx-only
         # y = y[:, [1]] # Fy-only
+        ################################################
 
         out_dir = _resolve_path(os.path.join(OUT_ROOT, f"bin_{bin_len}"))
         out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\n[RUN] bin_len={bin_len} -> X={X.shape}, y={y.shape} | unique groups={len(np.unique(groups))}")
+        print(f"\n[RUN] bin_len={bin_len} -> y={y.shape} | unique groups={len(np.unique(groups))}")
 
-        # --- Hold out exactly one plateau per *nominal* angle for test ---
-        train_idx, test_idx, test_groups = split_one_plateau_per_angle_test(groups, rng=RNG)
-        X_tr, y_tr, groups_tr = X[train_idx], y[train_idx], groups[train_idx]
-        X_te, y_te, groups_te = X[test_idx],  y[test_idx],  groups[test_idx]
+        # --- Hold out exactly one plateau per nominal (MCP) angle for test ---
+        train_idx, test_idx, test_groups = split_one_plateau_per_angle_test(groups, nominal_angles, rng=RNG)
+        y_tr, y_te = y[train_idx], y[test_idx]
+        groups_tr, groups_te = groups[train_idx], groups[test_idx]
+
+        # Prepare X_by_mode splits
+        X_by_mode_tr, X_by_mode_te = {}, {}
+        for mode, X in X_by_mode.items():
+            if mode == "iterative_addition":
+                X_by_mode_tr[mode] = [ Xk[train_idx] for Xk in X ]
+                X_by_mode_te[mode] = [ Xk[test_idx]  for Xk in X ]
+            else:
+                X_by_mode_tr[mode] = X[train_idx]
+                X_by_mode_te[mode] = X[test_idx]
 
         # Cap CV folds to number of unique train groups
         n_train_groups = len(np.unique(groups_tr))
         cv_folds = min(CV_FOLDS, n_train_groups) if n_train_groups > 1 else 2
 
-        # --- Channel modes to evaluate ---
-        n_ch = X.shape[1]
-        channel_modes = [
+        # --- Modes to evaluate (match keys we built) ---
+        modes_to_eval = [
             {"name": "rms_matrix",       "mode": "rms_matrix"},
             {"name": "all_channels",     "mode": "all_channels"},
             {"name": "average_channels", "mode": "average_channels"},
-            {"name": "single_ch_0",      "mode": "single_channel", "channels": [0]},
-            {"name": "iterative_add",    "mode": "iterative_addition", "channels": list(range(n_ch))},
+            {"name": "iterative_add",    "mode": "iterative_addition"},
         ]
 
         # --- GroupKFold CV on train only (leakage-safe) ---
-        results = run_modes(X_tr, y_tr, groups_tr, channel_modes, cv=cv_folds, use_scaler=USE_SCALER, scale_targets=SCALE_Y)
+        results = run_modes(X_by_mode_tr, y_tr, groups_tr, modes_to_eval, cv=cv_folds, use_scaler=USE_SCALER, scale_targets=SCALE_Y)
         save_results(results, str(out_dir), tag="cv_metrics_train")
 
         # --- Train on full train set and save models ---
-        train_and_save_models(X_tr, y_tr, channel_modes, str(out_dir), use_scaler=USE_SCALER, scale_targets=SCALE_Y)
+        train_and_save_models(X_by_mode_tr, y_tr, modes_to_eval, str(out_dir), use_scaler=USE_SCALER, scale_targets=SCALE_Y)
 
-        # --- Optional: quick diagnostic CV plot (train set) ---
-        plot_cv_reconstruction(
-            X_tr, y_tr,
-            cfg={"name": "rms_matrix", "mode": "rms_matrix"},
-            out_path=str(out_dir / "cv_reconstruction_rms_matrix_train.png"),
-            cv=cv_folds, use_scaler=USE_SCALER, scale_targets=SCALE_Y, bin_size=bin_len
-        )
+        # --- Optional: quick diagnostic CV plot (only for non-iterative mode and 2-D Fx/Fy targets) ---
+        # Example (uncomment to use with Fx/Fy targets):
+        # plot_cv_reconstruction(
+        #     X_by_mode_tr["rms_matrix"], y_tr,
+        #     cfg={"name": "rms_matrix", "mode": "rms_matrix"},
+        #     out_path=str(out_dir / "cv_reconstruction_rms_matrix_train.png"),
+        #     cv=cv_folds, use_scaler=USE_SCALER, scale_targets=SCALE_Y, bin_size=bin_len
+        # )
 
         # Save which groups were used
         with open(out_dir / "train_groups.txt", "w") as f:
@@ -467,7 +526,6 @@ def main():
         with open(out_dir / "test_groups.txt", "w") as f:
             f.write("\n".join(map(str, sorted(test_groups))))
 
-        # Simple holdout description
         print(f"[HOLDOUT] test rows: {len(test_idx)} | groups: {len(np.unique(groups_te))}")
 
     print("\n[DONE] All bin sizes processed.")

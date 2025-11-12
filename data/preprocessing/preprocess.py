@@ -255,14 +255,15 @@ def preprocess_plateaus(
         if "iterative_addition" in req:
             if iterative_channels is None or len(iterative_channels) == 0:
                 raise ValueError("iterative_addition mode requires iterative_channels (list of ints)")
-            # cumulative sets: for k in 1..K, RMS across channels[0:k]
+            if not all(0 <= ch < R.shape[1] for ch in iterative_channels):
+                raise IndexError("iterative_channels contains invalid channel indices")
+
+            # Cumulative HSTACK of *raw* per-channel RMS features (no aggregation)
+            # step k uses the first k channels from iterative_channels -> shape (N, k)
             steps: List[np.ndarray] = []
             for k in range(1, len(iterative_channels) + 1):
                 subset = iterative_channels[:k]
-                if not all(0 <= ch < R.shape[1] for ch in subset):
-                    raise IndexError("iterative_channels contains invalid channel indices")
-                # RMS across subset at each time step
-                steps.append(np.sqrt(np.nanmean(R[:, subset]**2, axis=1, keepdims=True)))  # (N,1)
+                steps.append(R[:, subset])   # (N, k)
             emg_dict["iterative_addition"] = steps
       
 
