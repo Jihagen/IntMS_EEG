@@ -37,7 +37,7 @@ def _expand_combined_files(dir_or_glob: str):
     if p.is_file():
         return [str(p)]
     if p.is_dir():
-        return sorted(glob.glob(str(p / "*_combined.npy")))
+        return sorted(glob.glob(str(p / "*.npy")))
     return sorted(glob.glob(str(p)))  # treat as glob
 
 def _bin_series(arr, bin_len, agg="mean"):
@@ -468,7 +468,7 @@ def main():
         # TARGET CHOICES (select one)
         ################################################
         # Angle-only   (Fx=0, Fy=1, Angle=2)
-        y = y[:, [2]]
+        # y = y[:, [2]]
         # y = y[:, [0]] # Fx-only
         # y = y[:, [1]] # Fy-only
         ################################################
