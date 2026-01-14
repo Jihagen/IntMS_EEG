@@ -421,8 +421,18 @@ def main():
     ap.add_argument("--cv", type=int, default=5)
     ap.add_argument("--bin-sec", type=float, default=0.050, help="Bin size in seconds (e.g., 0.05)")
     ap.add_argument("--rms-win", type=int, default=100, help="RMS window (samples) on native time grid")
-    ap.add_argument("--no-x-scaler", action="store_true", help="Disable StandardScaler on X")
-    ap.add_argument("--no-y-scaler", action="store_true", help="Disable MinMaxScaler on y")
+    ap.add_argument(
+    "--x-scaler",
+    choices=["standard", "none"],
+    default="standard",
+    help="Feature scaling for X. Use 'none' to disable StandardScaler."
+    )
+    ap.add_argument(
+        "--y-scaler",
+        choices=["minmax", "none"],
+        default="minmax",
+        help="Target scaling for y. Use 'none' to disable MinMaxScaler."
+    )
     ap.add_argument("--no-angle-target", action="store_true", help="Do not include angle as 3rd output")
     ap.add_argument("--random-state", type=int, default=42)
     # optional: if you want single_channel or a custom channel order for iterative
@@ -436,8 +446,9 @@ def main():
     CV_FOLDS    = args.cv
     BIN_SEC     = args.bin_sec
     RMS_WIN     = args.rms_win
-    USE_SCALER  = not args.no_x_scaler
-    SCALE_Y     = not args.no_y_scaler
+    USE_SCALER = (args.x_scaler == "standard")
+    SCALE_Y    = (args.y_scaler == "minmax")
+
     INCLUDE_ANGLE_TARGET = not args.no_angle_target
     RNG         = args.random_state
 
@@ -468,10 +479,13 @@ def main():
         # TARGET CHOICES (select one)
         ################################################
         # Angle-only   (Fx=0, Fy=1, Angle=2)
+        #
+        y = nominal_angles.reshape(-1,1)
         # y = y[:, [2]]
         # y = y[:, [0]] # Fx-only
         # y = y[:, [1]] # Fy-only
         ################################################
+        print(y)
 
         out_dir = _resolve_path(os.path.join(OUT_ROOT, f"bin_{bin_len}"))
         out_dir.mkdir(parents=True, exist_ok=True)
