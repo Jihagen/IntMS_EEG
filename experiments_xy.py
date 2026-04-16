@@ -455,8 +455,11 @@ def main():
     it_channels = None
     if args.iterative_channels:
         it_channels = [int(s) for s in args.iterative_channels.split(",") if s.strip()]
+    else:
+        # default: all 16 channels in your intended order
+        it_channels = list(range(16))
 
-    MODES_REQUESTED = ("rms_matrix", "all_channels", "average_channels",) # "iterative_addition"
+    MODES_REQUESTED = ("rms_matrix", "all_channels", "average_channels") # "iterative_addition"
 
     # Build dataset from combined files (once; includes all requested modes)
     buckets = collect_dataset_from_combined(
@@ -480,7 +483,7 @@ def main():
         ################################################
         # Angle-only   (Fx=0, Fy=1, Angle=2)
         #
-        y = nominal_angles.reshape(-1,1)
+        # y = nominal_angles.reshape(-1,1)
         # y = y[:, [2]]
         # y = y[:, [0]] # Fx-only
         # y = y[:, [1]] # Fy-only
@@ -515,7 +518,7 @@ def main():
             {"name": "rms_matrix",       "mode": "rms_matrix"},
             {"name": "all_channels",     "mode": "all_channels"},
             {"name": "average_channels", "mode": "average_channels"},
-           # {"name": "iterative_add",    "mode": "iterative_addition"},
+            {"name": "iterative_add",    "mode": "iterative_addition"},
         ]
 
         # --- GroupKFold CV on train only (leakage-safe) ---

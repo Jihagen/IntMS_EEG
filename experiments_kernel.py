@@ -1,25 +1,32 @@
-# angle_experiments/experiments_kernel
-# 
-# .py
-# Pipeline: read *_combined.npy, preprocess into segments, bin, then split by MCP angle groups.
-# Updated: supports Kernel Ridge (RBF) + sin/cos targets + scaler toggles via argparse.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# angle_experiments/experiments_kernel.py
+#
+# Pipeline: read *_combined.npy, preprocess into segments, bin, split by MCP-angle groups.
+# Supports: Ridge, KernelRidge(RBF)
+# Targets: fxfy, fxfy_achieved, achieved_angle, nominal_angle, achieved_sincos, nominal_sincos
+#
+# FIXES:
+# - Safer y scaling per target (no MinMax on sin/cos; special handling for fxfy_achieved)
+# - Optional projection of predicted sin/cos onto unit circle
+# - Better debug prints to catch "collapse to zero-force" early
+# - Saves run_meta.json per bin (target + scaler choices)
 
-import os
-import glob
+import os, glob, json
 from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 from sklearn.linear_model import Ridge
 from sklearn.kernel_ridge import KernelRidge
-from sklearn.multioutput import MultiOutputRegressor
 from sklearn.model_selection import GroupKFold, cross_val_score
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 import joblib
+
+from data.preprocessing.preprocess import preprocess_plateaus  # your preprocessor
 
 # -------------------- Path helpers --------------------
 
@@ -29,10 +36,6 @@ def _resolve_path(p: str) -> Path:
     q = Path(p).expanduser()
     return q if q.is_absolute() else (SCRIPT_DIR / q).resolve()
 
-# -------------------- Preprocessor --------------------
-
-from data.preprocessing.preprocess import preprocess_plateaus  # your preprocessor
-
 def _expand_combined_files(dir_or_glob: str):
     p = _resolve_path(dir_or_glob)
     if p.is_file():
@@ -40,6 +43,8 @@ def _expand_combined_files(dir_or_glob: str):
     if p.is_dir():
         return sorted(glob.glob(str(p / "*.npy")))
     return sorted(glob.glob(str(p)))  # treat as glob
+
+# -------------------- Binning --------------------
 
 def _bin_series(arr, bin_len, agg="mean"):
     """Bin 1D/2D along axis=0 into chunks of length bin_len. Drops tail if not divisible."""
@@ -49,17 +54,18 @@ def _bin_series(arr, bin_len, agg="mean"):
         B = max(1, N // bin_len)
         if N < bin_len:
             return A.reshape(1, -1).mean(axis=1)
-        A2 = A[:B*bin_len].reshape(B, bin_len)
+        A2 = A[:B * bin_len].reshape(B, bin_len)
         return A2.mean(axis=1) if agg == "mean" else np.median(A2, axis=1)
-    elif A.ndim == 2:
+
+    if A.ndim == 2:
         N, C = A.shape
         B = max(1, N // bin_len)
         if N < bin_len:
             return A.reshape(1, N, C).mean(axis=1)
-        A2 = A[:B*bin_len].reshape(B, bin_len, C)
+        A2 = A[:B * bin_len].reshape(B, bin_len, C)
         return A2.mean(axis=1) if agg == "mean" else np.median(A2, axis=1)
-    else:
-        raise ValueError("arr must be 1D or 2D")
+
+    raise ValueError("arr must be 1D or 2D")
 
 def _samples_per_bin_from_seconds(fs, bin_sec):
     return max(1, int(round(fs * float(bin_sec))))
@@ -74,11 +80,22 @@ def angle_to_sincos_deg(angle_deg):
     return np.stack([np.sin(th), np.cos(th)], axis=1)
 
 def sincos_to_angle_deg(sin_cos_2d):
-    # sin_cos_2d: (N,2) = [sin, cos]
     s = sin_cos_2d[:, 0]
     c = sin_cos_2d[:, 1]
     ang = np.degrees(np.arctan2(s, c))
     return _wrap_deg(ang)
+
+def circ_diff_deg(a, b):
+    return (a - b + 180.0) % 360.0 - 180.0
+
+def circ_mae_deg(a, b):
+    return float(np.mean(np.abs(circ_diff_deg(a, b))))
+
+def _project_to_unit_circle(sc2):
+    sc2 = np.asarray(sc2, float)
+    eps = 1e-9
+    r = np.sqrt(sc2[:, 0] ** 2 + sc2[:, 1] ** 2) + eps
+    return sc2 / r[:, None]
 
 # -------------------- Dataset collector --------------------
 
@@ -92,18 +109,6 @@ def collect_dataset_from_combined(
     iterative_channels=None,
     segment_kind: str = "plateau",
 ):
-    """
-    Returns dict keyed by bin_len (samples). For each bin_len:
-
-      buckets[bin_len] = {
-        "X_by_mode": {mode -> array/list},
-        "y": (N, 2/3)  -> Fx, Fy, [AngleAchieved],
-        "groups": (N,),
-        "angles": (N,) -> achieved angle (binned mean),
-        "nominal_angles": (N,) -> MCP angle replicated per row,
-        "files": [...]
-      }
-    """
     files = _expand_combined_files(combined_dir_or_glob)
     print(f"[PATH] combined-dir: {combined_dir_or_glob} -> resolved: {_resolve_path(combined_dir_or_glob)}")
     print(f"[PATH] matched files: {len(files)}")
@@ -137,25 +142,25 @@ def collect_dataset_from_combined(
         fs = segs[0]["fs"] or (1.0 / np.median(np.diff(segs[0]["signals"]["t"])))
         bin_len = _samples_per_bin_from_seconds(fs, bin_sec)
 
-        # nominal MCP angle for this file/trial
         try:
             mcp_angle = int(payload.get("MCP_Angle", np.nan))
         except Exception:
             mcp_angle = np.nan
 
         for seg in segs:
-            Fx  = seg["signals"]["Fx"].reshape(-1)
-            Fy  = seg["signals"]["Fy"].reshape(-1)
+            Fx = seg["signals"]["Fx"].reshape(-1)
+            Fy = seg["signals"]["Fy"].reshape(-1)
             ang = seg["signals"]["angle_achieved"].reshape(-1)  # [0,360)
 
             R_native = seg["emg"]["rms_matrix"]
             N = min(R_native.shape[0], Fx.size, Fy.size, ang.size)
             Fx, Fy, ang = Fx[:N], Fy[:N], ang[:N]
 
-            Fxb  = _bin_series(Fx,  bin_len, agg="mean").reshape(-1, 1)
-            Fyb  = _bin_series(Fy,  bin_len, agg="mean").reshape(-1, 1)
+            Fxb = _bin_series(Fx, bin_len, agg="mean").reshape(-1, 1)
+            Fyb = _bin_series(Fy, bin_len, agg="mean").reshape(-1, 1)
             Angb = _bin_series(ang, bin_len, agg="mean").reshape(-1, 1)
-            yb   = np.hstack([Fxb, Fyb, Angb]) if include_angle_target else np.hstack([Fxb, Fyb])
+
+            yb = np.hstack([Fxb, Fyb, Angb]) if include_angle_target else np.hstack([Fxb, Fyb])
 
             X_modes_binned = {}
 
@@ -177,18 +182,22 @@ def collect_dataset_from_combined(
                 else:
                     X_modes_binned[mode] = _bin_and_trim(val, B)
 
-            yb   = yb[:B, :]
+            yb = yb[:B, :]
             Angb = Angb[:B, 0]
 
             group_label = f"{f}::{seg['name']}"
-            groups_seg  = np.full((B,), group_label, dtype=object)
-            nom_seg     = np.full((B,), mcp_angle, dtype=float)
+            groups_seg = np.full((B,), group_label, dtype=object)
+            nom_seg = np.full((B,), mcp_angle, dtype=float)
 
             key = int(bin_len)
             if key not in buckets:
                 buckets[key] = {
                     "X_by_mode": defaultdict(list),
-                    "y": [], "groups": [], "angles": [], "nominal_angles": [], "files": []
+                    "y": [],
+                    "groups": [],
+                    "angles": [],
+                    "nominal_angles": [],
+                    "files": [],
                 }
 
             for mode, Xb in X_modes_binned.items():
@@ -214,16 +223,16 @@ def collect_dataset_from_combined(
                 for seg_list in chunks:
                     for k_idx, arr in enumerate(seg_list):
                         by_k[k_idx].append(arr)
-                X_by_mode[mode] = [np.vstack(lst) if lst else np.empty((0,1)) for k_idx, lst in sorted(by_k.items())]
+                X_by_mode[mode] = [np.vstack(lst) if lst else np.empty((0, 1)) for _, lst in sorted(by_k.items())]
             else:
                 X_by_mode[mode] = np.vstack(chunks) if chunks else np.empty((0, 0))
 
         buckets[key] = {
             "X_by_mode": X_by_mode,
-            "y": y,
+            "y": y,  # (N,3) Fx,Fy,angle_achieved
             "groups": groups,
-            "angles": angles,
-            "nominal_angles": nomang,
+            "angles": angles,          # binned achieved angle
+            "nominal_angles": nomang,  # replicated MCP label
             "files": pack["files"],
         }
 
@@ -232,7 +241,7 @@ def collect_dataset_from_combined(
     print(f"[DONE] processed files: {used_files}/{len(files)}")
     return buckets
 
-# -------------------- Grouped holdout via MCP_angle --------------------
+# -------------------- Grouped holdout --------------------
 
 def split_one_plateau_per_angle_test(groups, nominal_angles, rng=42):
     """Pick exactly one plateau group per nominal angle for test."""
@@ -256,53 +265,124 @@ def split_one_plateau_per_angle_test(groups, nominal_angles, rng=42):
     for g in test_groups:
         test_mask[group_to_rows[g]] = True
 
-    test_idx  = np.where(test_mask)[0]
+    test_idx = np.where(test_mask)[0]
     train_idx = np.where(~test_mask)[0]
     return train_idx, test_idx, test_groups
 
+# -------------------- Target construction + y scaling --------------------
+
+class _FxFyAngleScaler:
+    """
+    Columnwise scaling for y = [Fx, Fy, angle_deg]
+    - Fx,Fy: StandardScaler
+    - angle_deg: map to [-1,1] via (angle/180 - 1), then StandardScaler optional (we keep it identity)
+    """
+    def __init__(self):
+        self.scaler_xy = StandardScaler()
+        self.angle_mode = "deg_to_unit"  # internal marker
+
+    def fit(self, y):
+        y = np.asarray(y, float)
+        self.scaler_xy.fit(y[:, :2])
+        return self
+
+    def transform(self, y):
+        y = np.asarray(y, float)
+        xy = self.scaler_xy.transform(y[:, :2])
+        ang_unit = (np.mod(y[:, 2], 360.0) / 180.0) - 1.0  # [-1,1]
+        return np.column_stack([xy, ang_unit])
+
+    def inverse_transform(self, y_scaled):
+        y_scaled = np.asarray(y_scaled, float)
+        xy = self.scaler_xy.inverse_transform(y_scaled[:, :2])
+        ang_unit = y_scaled[:, 2]
+        ang_deg = np.mod((ang_unit + 1.0) * 180.0, 360.0)
+        return np.column_stack([xy, ang_deg])
+
+def build_target(TARGET, y_full, nominal_angles, achieved_angles):
+    """
+    Returns (y, target_kind) where target_kind describes how to evaluate.
+    """
+    TARGET = TARGET.lower()
+
+    if TARGET == "fxfy":
+        y = y_full[:, [0, 1]]
+        return y, "fxfy"
+
+    if TARGET == "fxfy_achieved":
+        # NOTE: numeric mix → must use _FxFyAngleScaler (handled below)
+        y = y_full[:, [0, 1, 2]]
+        return y, "fxfy_achieved"
+
+    if TARGET == "achieved_angle":
+        y = achieved_angles.reshape(-1, 1).astype(float)
+        return y, "angle_deg"
+
+    if TARGET == "nominal_angle":
+        y = nominal_angles.reshape(-1, 1).astype(float)
+        return y, "angle_deg"
+
+    if TARGET == "achieved_sincos":
+        y = angle_to_sincos_deg(achieved_angles.astype(float))
+        return y, "sincos"
+
+    if TARGET == "nominal_sincos":
+        y = angle_to_sincos_deg(nominal_angles.astype(float))
+        return y, "sincos"
+
+    raise ValueError(f"Unknown TARGET: {TARGET}")
+
+def make_y_scaler(y_kind, y_scaler_choice):
+    """
+    Returns a fitted scaler object or None.
+    y_scaler_choice in {"none","standard","fxfy_angle"}.
+    """
+    if y_kind == "sincos":
+        # never scale sin/cos targets
+        return None
+
+    if y_scaler_choice == "none":
+        return None
+
+    if y_kind == "fxfy":
+        if y_scaler_choice == "standard":
+            return StandardScaler()
+        raise ValueError("For y_kind=fxfy use y-scaler=standard or none.")
+
+    if y_kind == "fxfy_achieved":
+        # force the special scaler
+        if y_scaler_choice in ("fxfy_angle", "standard"):
+            return _FxFyAngleScaler()
+        raise ValueError("For y_kind=fxfy_achieved use y-scaler=fxfy_angle (recommended).")
+
+    if y_kind == "angle_deg":
+        if y_scaler_choice == "standard":
+            return StandardScaler()
+        return None
+
+    raise ValueError(f"Unhandled y_kind: {y_kind}")
+
 # -------------------- Model builders --------------------
 
-def _make_estimator(model_name: str, krr_alpha: float, krr_gamma: float):
+def make_estimator(model_name: str, krr_alpha: float, krr_gamma: float):
     model_name = model_name.lower()
     if model_name == "ridge":
-        base = Ridge()
-    elif model_name == "krr":
-        # RBF kernel ridge
-        base = KernelRidge(alpha=float(krr_alpha), kernel="rbf", gamma=float(krr_gamma))
-    else:
-        raise ValueError(f"Unknown model: {model_name} (use 'ridge' or 'krr')")
-    return base
+        return Ridge()
+    if model_name == "krr":
+        return KernelRidge(alpha=float(krr_alpha), kernel="rbf", gamma=float(krr_gamma))
+    raise ValueError(f"Unknown model: {model_name} (use 'ridge' or 'krr')")
 
-def _wrap_multioutput_if_needed(est, y):
-    # If y has multiple cols, wrap. If 1 col, keep plain estimator.
-    return MultiOutputRegressor(est) if y.ndim == 2 and y.shape[1] > 1 else est
-
-def _maybe_pipeline_x(est, x_scaler: str):
+def maybe_pipeline_x(est, x_scaler: str):
     if x_scaler == "standard":
         return Pipeline([("xscale", StandardScaler()), ("est", est)])
     if x_scaler == "none":
         return est
-    raise ValueError("x_scaler must be 'standard' or 'none'")
-
-def _maybe_scale_y(y, y_scaler: str):
-    if y_scaler == "minmax":
-        sc = MinMaxScaler()
-        return sc.fit_transform(y), sc
-    if y_scaler == "none":
-        return y, None
-    raise ValueError("y_scaler must be 'minmax' or 'none'")
+    raise ValueError("x-scaler must be 'standard' or 'none'")
 
 # -------------------- Metrics --------------------
 
-def circ_diff_deg(a, b):
-    return (a - b + 180.0) % 360.0 - 180.0
-
-def circ_mae_deg(a, b):
-    return float(np.mean(np.abs(circ_diff_deg(a, b))))
-
-def eval_cv(X, y, groups, cv_folds, estimator, is_angle_sincos=False):
+def eval_cv(X, y, groups, cv_folds, estimator):
     splitter = GroupKFold(n_splits=cv_folds)
-    # Standard MAE/MSE on y-space; for sincos also print angle MAE via CV preds (optional)
     mse = -np.mean(cross_val_score(estimator, X, y, cv=splitter, groups=groups, scoring="neg_mean_squared_error"))
     mae = -np.mean(cross_val_score(estimator, X, y, cv=splitter, groups=groups, scoring="neg_mean_absolute_error"))
     return float(mse), float(mae)
@@ -313,44 +393,36 @@ def main():
     import argparse
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--feature-dir", default="data/preprocessing/P5_combined",
-                    help="Folder/file/glob for *_combined.npy files")
-    ap.add_argument("--kind", default="plateau", help="Segment kind (plateau/ramp/...)")
-    ap.add_argument("--out-root", default="./results_feat/P5_angle")
+    ap.add_argument("--feature-dir", default="data/preprocessing/P5_combined")
+    ap.add_argument("--kind", default="plateau")
+    ap.add_argument("--out-root", default="./results_kernel/P5_kernel")
     ap.add_argument("--cv", type=int, default=5)
     ap.add_argument("--bin-sec", type=float, default=0.050)
     ap.add_argument("--rms-win", type=int, default=100)
     ap.add_argument("--random-state", type=int, default=42)
 
-    # NEW: scaler choices (this fixes your earlier CLI confusion)
-    ap.add_argument("--x-scaler", choices=["standard", "none"], default="standard",
-                    help="Feature scaling: StandardScaler or none")
-    ap.add_argument("--y-scaler", choices=["minmax", "none"], default="minmax",
-                    help="Target scaling: MinMaxScaler or none")
+    ap.add_argument("--x-scaler", choices=["standard", "none"], default="standard")
+    # IMPORTANT: default changed away from minmax
+    ap.add_argument("--y-scaler", choices=["none", "standard", "fxfy_angle"], default="standard",
+                    help="Target scaling. For sin/cos it's forced to none. For fxfy_achieved use fxfy_angle.")
 
-    # NEW: model choice
-    ap.add_argument("--model", choices=["ridge", "krr"], default="ridge",
-                    help="Regressor: ridge or krr (KernelRidge RBF)")
-    ap.add_argument("--krr-alpha", type=float, default=1.0,
-                    help="KernelRidge alpha (regularization)")
-    ap.add_argument("--krr-gamma", type=float, default=0.1,
-                    help="KernelRidge gamma for RBF (try 0.01..10)")
+    ap.add_argument("--model", choices=["ridge", "krr"], default="krr")
+    ap.add_argument("--krr-alpha", type=float, default=1.0)
+    ap.add_argument("--krr-gamma", type=float, default=0.1)
 
-    # Target selection
-    ap.add_argument("--target", default="nominal_sincos", choices=[
-        "fxfy",                 # y = [Fx, Fy]
-        "fxfy_achieved",        # y = [Fx, Fy, achieved_angle_deg]
-        "achieved_angle",       # y = [achieved_angle_deg]
-        "nominal_angle",        # y = [nominal_angle_deg]
-        "achieved_sincos",      # y = [sin(ach), cos(ach)]
-        "nominal_sincos",       # y = [sin(nom), cos(nom)]
-    ], help="What to predict")
+    ap.add_argument("--target", default="fxfy", choices=[
+        "fxfy",
+        "fxfy_achieved",
+        "achieved_angle",
+        "nominal_angle",
+        "achieved_sincos",
+        "nominal_sincos",
+    ])
 
-    # modes
-    ap.add_argument("--modes", type=str, default="rms_matrix,all_channels,average_channels",
-                    help="Comma-separated feature modes to build")
+    ap.add_argument("--modes", type=str, default="rms_matrix")
     ap.add_argument("--single-channel-idx", type=int, default=None)
     ap.add_argument("--iterative-channels", type=str, default=None)
+
     args = ap.parse_args()
 
     FEATURE_DIR = args.feature_dir
@@ -387,58 +459,67 @@ def main():
 
     for bin_len, bundle in buckets.items():
         X_by_mode = bundle["X_by_mode"]
-        y_full = bundle["y"]               # (N,3) = Fx,Fy,achieved_angle
+        y_full = bundle["y"]  # (N,3)=Fx,Fy,achieved_angle
         groups = bundle["groups"]
-        nominal_angles = bundle["nominal_angles"]
-        achieved_angles = bundle["angles"] # already binned mean achieved
+        nominal_angles = bundle["nominal_angles"].astype(float)
+        achieved_angles = bundle["angles"].astype(float)
 
-        # --- build y according to TARGET
-        if TARGET == "fxfy":
-            y = y_full[:, [0, 1]]
-            is_sincos = False
-        elif TARGET == "fxfy_achieved":
-            y = y_full[:, [0, 1, 2]]
-            is_sincos = False
-        elif TARGET == "achieved_angle":
-            y = achieved_angles.reshape(-1, 1).astype(float)
-            is_sincos = False
-        elif TARGET == "nominal_angle":
-            y = nominal_angles.reshape(-1, 1).astype(float)
-            is_sincos = False
-        elif TARGET == "achieved_sincos":
-            y = angle_to_sincos_deg(achieved_angles.astype(float))
-            is_sincos = True
-        elif TARGET == "nominal_sincos":
-            y = angle_to_sincos_deg(nominal_angles.astype(float))
-            is_sincos = True
+        y, y_kind = build_target(TARGET, y_full, nominal_angles, achieved_angles)
+
+        # enforce safe y-scaler rules
+        if y_kind == "sincos":
+            if Y_SCALER != "none":
+                print("[WARN] forcing y-scaler=none for sin/cos target.")
+            Y_SCALER_EFFECTIVE = "none"
+        elif y_kind == "fxfy_achieved":
+            # strongly recommend fxfy_angle
+            if Y_SCALER not in ("fxfy_angle", "standard"):
+                print("[WARN] forcing y-scaler=fxfy_angle for fxfy_achieved target.")
+                Y_SCALER_EFFECTIVE = "fxfy_angle"
+            else:
+                Y_SCALER_EFFECTIVE = "fxfy_angle"
         else:
-            raise ValueError("Unknown TARGET")
+            Y_SCALER_EFFECTIVE = Y_SCALER
 
         out_dir = _resolve_path(os.path.join(OUT_ROOT, f"bin_{bin_len}"))
         out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\n[RUN] bin_len={bin_len} | target={TARGET} y={y.shape} | model={MODEL} | x_scaler={X_SCALER} y_scaler={Y_SCALER}")
+
+        print(f"\n[RUN] bin_len={bin_len} | target={TARGET} (kind={y_kind}) y={y.shape} | model={MODEL} | x={X_SCALER} y={Y_SCALER_EFFECTIVE}")
         print(f"      unique groups={len(np.unique(groups))}")
 
-        # --- Holdout
+        # Holdout split
         train_idx, test_idx, test_groups = split_one_plateau_per_angle_test(groups, nominal_angles, rng=RNG)
-        groups_tr, groups_te = groups[train_idx], groups[test_idx]
+        groups_tr = groups[train_idx]
 
-        # Cap CV folds to number of unique train groups
         n_train_groups = len(np.unique(groups_tr))
         cv_folds = min(CV_FOLDS, n_train_groups) if n_train_groups > 1 else 2
 
-        # Split y
+        # Fit target scaler on train only
         y_tr, y_te = y[train_idx], y[test_idx]
+        y_scaler = make_y_scaler(y_kind, Y_SCALER_EFFECTIVE)
+        if y_scaler is not None:
+            y_scaler.fit(y_tr)
+            y_tr_s = y_scaler.transform(y_tr)
+        else:
+            y_tr_s = y_tr
 
-        # Scale y (fit on train only)
-        y_tr_scaled, y_scaler = _maybe_scale_y(y_tr, Y_SCALER)
-        y_te_scaled = y_scaler.transform(y_te) if y_scaler is not None else y_te
+        # Save meta
+        meta = dict(
+            bin_len=int(bin_len),
+            target=TARGET,
+            y_kind=y_kind,
+            x_scaler=X_SCALER,
+            y_scaler=Y_SCALER_EFFECTIVE,
+            model=MODEL,
+            krr_alpha=float(KRR_ALPHA),
+            krr_gamma=float(KRR_GAMMA),
+            n_train_groups=int(n_train_groups),
+        )
+        (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2))
 
-        # Train/eval per mode
         rows = []
         for mode_name, Xmat in X_by_mode.items():
             if mode_name == "iterative_addition":
-                # skip here unless you actively use it
                 continue
             if mode_name not in MODES_REQUESTED:
                 continue
@@ -446,47 +527,55 @@ def main():
             X_tr = Xmat[train_idx]
             X_te = Xmat[test_idx]
 
-            est = _make_estimator(MODEL, KRR_ALPHA, KRR_GAMMA)
-            est = _wrap_multioutput_if_needed(est, y_tr_scaled)
-            est = _maybe_pipeline_x(est, X_SCALER)
+            est = make_estimator(MODEL, KRR_ALPHA, KRR_GAMMA)
+            est = maybe_pipeline_x(est, X_SCALER)
 
-            # CV on train
-            mse, mae = eval_cv(X_tr, y_tr_scaled, groups_tr, cv_folds, est, is_angle_sincos=is_sincos)
+            mse, mae = eval_cv(X_tr, y_tr_s, groups_tr, cv_folds, est)
             print(f"  [CV] mode={mode_name:>14s}  MSE={mse:.6f}  MAE={mae:.6f}")
 
-            # Fit full train and evaluate holdout (for quick sanity)
-            est.fit(X_tr, y_tr_scaled)
-            yhat_te = est.predict(X_te)
-            yhat_te = np.asarray(yhat_te).reshape(y_te_scaled.shape)
+            est.fit(X_tr, y_tr_s)
+            yhat_te_s = np.asarray(est.predict(X_te))
 
-            # unscale yhat if needed
-            yhat_te_un = y_scaler.inverse_transform(yhat_te) if y_scaler is not None else yhat_te
-            y_te_un = y_te  # already unscaled
+            # invert y scaling if used
+            if y_scaler is not None:
+                try:
+                    yhat_te = y_scaler.inverse_transform(yhat_te_s)
+                except Exception:
+                    yhat_te = yhat_te_s
+            else:
+                yhat_te = yhat_te_s
 
-            # If angle sincos: report circular MAE in degrees too
-            angle_mae = None
-            if TARGET in ("achieved_sincos", "nominal_sincos"):
-                ang_pred = sincos_to_angle_deg(yhat_te_un)
-                ang_true = sincos_to_angle_deg(y_te_un)
-                angle_mae = circ_mae_deg(ang_pred, ang_true)
-                print(f"       [HOLDOUT] mode={mode_name:>14s}  angle_MAE_deg={angle_mae:.3f}")
+            # extra debug for "force collapse"
+            if y_kind in ("fxfy", "fxfy_achieved"):
+                fxhat, fyhat = yhat_te[:, 0], yhat_te[:, 1]
+                print(f"       [DBG] pred Fx,Fy mean=({fxhat.mean():.4f},{fyhat.mean():.4f}) std=({fxhat.std():.4f},{fyhat.std():.4f}) "
+                      f"| ||Fhat|| mean={np.mean(np.hypot(fxhat,fyhat)):.4f}")
+
+            holdout_angle_mae = None
+            if y_kind == "sincos":
+                # project predictions to unit circle before converting
+                yhat_sc = _project_to_unit_circle(yhat_te[:, :2])
+                # y_te are already true sin/cos
+                ang_pred = sincos_to_angle_deg(yhat_sc)
+                ang_true = sincos_to_angle_deg(y_te[:, :2])
+                holdout_angle_mae = circ_mae_deg(ang_pred, ang_true)
+                print(f"       [HOLDOUT] sincos angle_MAE_deg={holdout_angle_mae:.3f} | mean_unit={np.mean(np.sqrt((yhat_sc**2).sum(1))):.3f}")
 
             rows.append({
                 "bin_len": int(bin_len),
                 "mode": mode_name,
                 "cv_mse": mse,
                 "cv_mae": mae,
-                "holdout_angle_mae_deg": angle_mae,
+                "holdout_angle_mae_deg": holdout_angle_mae,
             })
 
-            # Save model + y_scaler per mode
             joblib.dump(est, out_dir / f"{MODEL}_{mode_name}.joblib")
 
-        # Save y scaler once per bin (train-fit)
+        # save y scaler
         if y_scaler is not None:
             joblib.dump(y_scaler, out_dir / "y_scaler.joblib")
 
-        # Save which groups were used
+        # save groups
         with open(out_dir / "train_groups.txt", "w") as f:
             f.write("\n".join(map(str, sorted(np.unique(groups_tr)))))
         with open(out_dir / "test_groups.txt", "w") as f:
